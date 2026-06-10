@@ -267,6 +267,8 @@ async def check_shopify(
                 [number, month, year, cvv], price, proxy_url
             )
 
+            # DEBUG
+            return JSONResponse({"DEBUG_RAW": result, "Price": f"${price}"})
             response_text, gateway = parse_payment_response(result, price)
             resp_lower = response_text.lower()
 
