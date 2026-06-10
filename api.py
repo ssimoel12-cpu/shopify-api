@@ -45,71 +45,96 @@ async def get_product(session, site, proxy=None):
 
 async def get_checkout_token(session, site, variant_id, proxy=None):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
     }
 
-    # Method 1: Add to cart then checkout
-    try:
-        add_url = f"{site}/cart/add.js"
-        async with session.post(
-            add_url,
-            json={"id": int(variant_id), "quantity": 1},
-            proxy=proxy, timeout=TIMEOUT, ssl=False, headers=headers
-        ) as r:
-            pass  # ignore response, just add to cart
+    # Use a separate session with cookie jar for proper session handling
+    jar = aiohttp.CookieJar(unsafe=True)
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector, cookie_jar=jar) as s:
 
-        checkout_url = f"{site}/checkout"
-        async with session.get(
-            checkout_url, proxy=proxy, timeout=TIMEOUT,
-            ssl=False, allow_redirects=True, headers=headers
-        ) as r:
-            final_url = str(r.url)
-            token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
-            if token_match:
-                return token_match.group(1)
-    except:
-        pass
+        # Step 0: Visit homepage first to get session cookies
+        try:
+            async with s.get(site, proxy=proxy, timeout=TIMEOUT, ssl=False, headers=headers) as r:
+                pass
+        except:
+            pass
 
-    # Method 2: Cart permalink redirect
-    try:
-        cart_url = f"{site}/cart/{variant_id}:1"
-        async with session.get(
-            cart_url, proxy=proxy, timeout=TIMEOUT,
-            ssl=False, allow_redirects=True, headers=headers
-        ) as r:
-            final_url = str(r.url)
-            token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
-            if token_match:
-                return token_match.group(1)
-    except:
-        pass
+        # Method 1: Add to cart then go to checkout
+        try:
+            add_headers = {**headers, "Content-Type": "application/json", "Accept": "application/json"}
+            async with s.post(
+                f"{site}/cart/add.js",
+                json={"id": int(variant_id), "quantity": 1},
+                proxy=proxy, timeout=TIMEOUT, ssl=False, headers=add_headers
+            ) as r:
+                pass
 
-    # Method 3: checkout.js
-    try:
-        async with session.post(
-            f"{site}/cart/checkout.js",
-            proxy=proxy, timeout=TIMEOUT, ssl=False, headers=headers
-        ) as r:
-            final_url = str(r.url)
-            token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
-            if token_match:
-                return token_match.group(1)
-    except:
-        pass
+            async with s.get(
+                f"{site}/checkout",
+                proxy=proxy, timeout=TIMEOUT,
+                ssl=False, allow_redirects=True, headers=headers
+            ) as r:
+                final_url = str(r.url)
+                token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
+                if token_match:
+                    return token_match.group(1)
+                # Also check response body
+                body = await r.text()
+                token_match = re.search(r"/checkouts/([a-f0-9]{32})", body)
+                if token_match:
+                    return token_match.group(1)
+        except:
+            pass
 
-    # Method 4: checkout.json
-    try:
-        async with session.get(
-            f"{site}/checkout.json", proxy=proxy, timeout=TIMEOUT,
-            ssl=False, allow_redirects=True, headers=headers
-        ) as r:
-            final_url = str(r.url)
-            token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
-            if token_match:
-                return token_match.group(1)
-    except:
-        pass
+        # Method 2: cart.js then checkout
+        try:
+            async with s.post(
+                f"{site}/cart/add.js",
+                data=f"id={variant_id}&quantity=1",
+                proxy=proxy, timeout=TIMEOUT, ssl=False,
+                headers={**headers, "Content-Type": "application/x-www-form-urlencoded"}
+            ) as r:
+                pass
+
+            async with s.post(
+                f"{site}/cart/checkout.js",
+                proxy=proxy, timeout=TIMEOUT, ssl=False,
+                headers={**headers, "Accept": "application/json"},
+                allow_redirects=True
+            ) as r:
+                final_url = str(r.url)
+                token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
+                if token_match:
+                    return token_match.group(1)
+                body = await r.text()
+                token_match = re.search(r"/checkouts/([a-f0-9]{32})", body)
+                if token_match:
+                    return token_match.group(1)
+        except:
+            pass
+
+        # Method 3: Cart permalink
+        try:
+            async with s.get(
+                f"{site}/cart/{variant_id}:1",
+                proxy=proxy, timeout=TIMEOUT,
+                ssl=False, allow_redirects=True, headers=headers
+            ) as r:
+                final_url = str(r.url)
+                token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
+                if token_match:
+                    return token_match.group(1)
+                body = await r.text()
+                token_match = re.search(r"/checkouts/([a-f0-9]{32})", body)
+                if token_match:
+                    return token_match.group(1)
+        except:
+            pass
 
     return None
 
