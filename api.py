@@ -44,77 +44,75 @@ async def get_product(session, site, proxy=None):
 
 
 async def get_checkout_token(session, site, variant_id, proxy=None):
-    headers = {
+    html_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    json_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
-    # Use a separate session with cookie jar for proper session handling
+    def find_token(text):
+        m = re.search(r"/checkouts/([a-f0-9]{32})", text)
+        return m.group(1) if m else None
+
     jar = aiohttp.CookieJar(unsafe=True)
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector, cookie_jar=jar) as s:
 
-        # Step 0: Visit homepage first to get session cookies
+        # Step 0: Visit homepage to get session cookies
         try:
-            async with s.get(site, proxy=proxy, timeout=TIMEOUT, ssl=False, headers=headers) as r:
+            async with s.get(site, proxy=proxy, timeout=TIMEOUT, ssl=False, headers=html_headers) as r:
                 pass
         except:
             pass
 
-        # Method 1: Add to cart then go to checkout
+        # Method 1: Add to cart via JSON then GET /checkout
         try:
-            add_headers = {**headers, "Content-Type": "application/json", "Accept": "application/json"}
             async with s.post(
                 f"{site}/cart/add.js",
                 json={"id": int(variant_id), "quantity": 1},
-                proxy=proxy, timeout=TIMEOUT, ssl=False, headers=add_headers
+                proxy=proxy, timeout=TIMEOUT, ssl=False, headers=json_headers
             ) as r:
                 pass
 
             async with s.get(
                 f"{site}/checkout",
                 proxy=proxy, timeout=TIMEOUT,
-                ssl=False, allow_redirects=True, headers=headers
+                ssl=False, allow_redirects=True, headers=html_headers
             ) as r:
-                final_url = str(r.url)
-                token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
-                if token_match:
-                    return token_match.group(1)
-                # Also check response body
-                body = await r.text()
-                token_match = re.search(r"/checkouts/([a-f0-9]{32})", body)
-                if token_match:
-                    return token_match.group(1)
+                tok = find_token(str(r.url))
+                if tok: return tok
+                tok = find_token(await r.text())
+                if tok: return tok
         except:
             pass
 
-        # Method 2: cart.js then checkout
+        # Method 2: Add to cart via form then POST /cart/checkout
         try:
             async with s.post(
                 f"{site}/cart/add.js",
                 data=f"id={variant_id}&quantity=1",
                 proxy=proxy, timeout=TIMEOUT, ssl=False,
-                headers={**headers, "Content-Type": "application/x-www-form-urlencoded"}
+                headers={**json_headers, "Content-Type": "application/x-www-form-urlencoded"}
             ) as r:
                 pass
 
             async with s.post(
-                f"{site}/cart/checkout.js",
+                f"{site}/cart/checkout",
                 proxy=proxy, timeout=TIMEOUT, ssl=False,
-                headers={**headers, "Accept": "application/json"},
-                allow_redirects=True
+                headers=html_headers, allow_redirects=True
             ) as r:
-                final_url = str(r.url)
-                token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
-                if token_match:
-                    return token_match.group(1)
-                body = await r.text()
-                token_match = re.search(r"/checkouts/([a-f0-9]{32})", body)
-                if token_match:
-                    return token_match.group(1)
+                tok = find_token(str(r.url))
+                if tok: return tok
+                tok = find_token(await r.text())
+                if tok: return tok
         except:
             pass
 
@@ -123,16 +121,68 @@ async def get_checkout_token(session, site, variant_id, proxy=None):
             async with s.get(
                 f"{site}/cart/{variant_id}:1",
                 proxy=proxy, timeout=TIMEOUT,
-                ssl=False, allow_redirects=True, headers=headers
+                ssl=False, allow_redirects=True, headers=html_headers
+            ) as r:
+                tok = find_token(str(r.url))
+                if tok: return tok
+                tok = find_token(await r.text())
+                if tok: return tok
+        except:
+            pass
+
+        # Method 4: Add address then checkout (for stores requiring shipping)
+        try:
+            async with s.post(
+                f"{site}/cart/add.js",
+                json={"id": int(variant_id), "quantity": 1},
+                proxy=proxy, timeout=TIMEOUT, ssl=False, headers=json_headers
+            ) as r:
+                pass
+
+            # Get checkout page first
+            checkout_token = None
+            async with s.get(
+                f"{site}/checkout",
+                proxy=proxy, timeout=TIMEOUT,
+                ssl=False, allow_redirects=True, headers=html_headers
             ) as r:
                 final_url = str(r.url)
-                token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
-                if token_match:
-                    return token_match.group(1)
-                body = await r.text()
-                token_match = re.search(r"/checkouts/([a-f0-9]{32})", body)
-                if token_match:
-                    return token_match.group(1)
+                tok = find_token(final_url)
+                if tok:
+                    checkout_token = tok
+                else:
+                    body = await r.text()
+                    tok = find_token(body)
+                    if tok:
+                        checkout_token = tok
+
+            if checkout_token:
+                # Submit shipping address
+                address_data = {
+                    "_method": "patch",
+                    "authenticity_token": "",
+                    "previous_step": "contact_information",
+                    "step": "shipping_method",
+                    "checkout[email]": "test@gmail.com",
+                    "checkout[shipping_address][first_name]": "John",
+                    "checkout[shipping_address][last_name]": "Doe",
+                    "checkout[shipping_address][address1]": "123 Main St",
+                    "checkout[shipping_address][city]": "New York",
+                    "checkout[shipping_address][country]": "United States",
+                    "checkout[shipping_address][province]": "New York",
+                    "checkout[shipping_address][zip]": "10001",
+                    "checkout[shipping_address][phone]": "5551234567",
+                }
+                async with s.post(
+                    f"{site}/checkouts/{checkout_token}",
+                    data=address_data, proxy=proxy, timeout=TIMEOUT,
+                    ssl=False, allow_redirects=True,
+                    headers={**html_headers, "Content-Type": "application/x-www-form-urlencoded"}
+                ) as r:
+                    tok = find_token(str(r.url))
+                    if tok: return tok
+                    return checkout_token  # return original token even if redirect fails
+
         except:
             pass
 
@@ -182,7 +232,7 @@ async def check_shopify(
         if len(year) == 2:
             year = "20" + year
         site_url = normalize_url(site)
-        proxy_url = None
+        proxy_url = proxy if proxy else None
 
         connector = aiohttp.TCPConnector(ssl=False, limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
