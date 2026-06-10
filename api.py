@@ -23,9 +23,16 @@ async def get_product(session, site, proxy=None):
         f"{site}/products.json?limit=1",
         f"{site}/collections/all/products.json?limit=1",
     ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
     for url in urls:
         try:
-            async with session.get(url, proxy=proxy, timeout=TIMEOUT, ssl=False) as r:
+            kwargs = {"timeout": TIMEOUT, "ssl": False, "headers": headers}
+            if proxy:
+                kwargs["proxy"] = proxy
+            async with session.get(url, **kwargs) as r:
                 if r.status == 200:
                     data = await r.json(content_type=None)
                     products = data.get("products", [])
