@@ -27,6 +27,7 @@ async def get_product(session, site, proxy=None):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json",
     }
+    last_error = ""
     for url in urls:
         try:
             kwargs = {"timeout": TIMEOUT, "ssl": False, "headers": headers}
@@ -45,9 +46,12 @@ async def get_product(session, site, proxy=None):
                             "price": variant.get("price", "0.00"),
                             "title": p.get("title", ""),
                         }
-        except:
+                else:
+                    last_error = f"status={r.status} url={url}"
+        except Exception as e:
+            last_error = f"exception={str(e)[:100]} url={url}"
             continue
-    return None
+    return {"_error": last_error}
 
 
 async def get_checkout_token(session, site, variant_id, proxy=None):
@@ -245,8 +249,9 @@ async def check_shopify(
         async with aiohttp.ClientSession(connector=connector) as session:
 
             product = await get_product(session, site_url, proxy_url)
-            if not product:
-                return JSONResponse({"Status": False, "Response": "No valid products", "Price": "-", "Gate": "Shopify"})
+            if not product or "_error" in product:
+                err = product.get("_error", "unknown") if product else "none returned"
+                return JSONResponse({"Status": False, "Response": "No valid products", "Debug": err, "Price": "-", "Gate": "Shopify"})
 
             price = product["price"]
             variant_id = product["variant_id"]
